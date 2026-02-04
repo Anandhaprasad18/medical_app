@@ -3,11 +3,13 @@ import pandas as pd
 import google.generativeai as genai
 from supabase import create_client, Client
 import random, string
+import datetime
 
-# --- APP CONFIG & DB CONNECTION ---
-st.set_page_config(page_title="MediCloud AI", layout="wide")
+# --- 1. APP CONFIG & DB CONNECTION ---
+st.set_page_config(page_title="MediCloud AI", layout="wide", page_icon="🏥")
 
-# Connect to Supabase (Add these to your Streamlit Secrets!)
+# Connect to Supabase
+# Ensure these are set in your Streamlit Cloud Secrets or .streamlit/secrets.toml
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
@@ -22,14 +24,15 @@ def generate_creds():
     pwd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
     return f"PAT-{uid}", pwd
 
-# --- LOGIN SYSTEM ---
+# --- 2. LOGIN SYSTEM ---
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.user_role = None
     st.session_state.user_data = None
 
 def logout():
-    st.session_state.logged_in = False
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
     st.rerun()
 
 if not st.session_state.logged_in:
@@ -39,7 +42,7 @@ if not st.session_state.logged_in:
     password = st.text_input("Password", type="password")
     
     if st.button("Login"):
-        # For Hackathon: Hardcoded Doctor login (ID: admin, Pass: admin)
+        # Doctor Hardcoded Login
         if role == "Doctor" and user_id == "admin" and password == "admin":
             st.session_state.logged_in = True
             st.session_state.user_role = "Doctor"
@@ -56,7 +59,7 @@ if not st.session_state.logged_in:
                 st.error("Invalid Credentials")
     st.stop()
 
-# --- DOCTOR DASHBOARD ---
+# --- 3. DOCTOR DASHBOARD ---
 if st.session_state.user_role == "Doctor":
     st.sidebar.button("Logout", on_click=logout)
     st.title("👨‍⚕️ Clinician Control Center")
@@ -64,48 +67,98 @@ if st.session_state.user_role == "Doctor":
     menu = st.sidebar.radio("Navigation", ["Register New Patient", "Update Records"])
     
     if menu == "Register New Patient":
+        st.subheader("Add New Patient to System")
         name = st.text_input("Full Name")
         if st.button("Generate Account"):
-            login_id, password = generate_creds()
-            supabase.table("patients").insert({"name": name, "login_id": login_id, "password": password}).execute()
-            st.success(f"Patient Registered!\n**ID:** {login_id}  \n**Password:** {password}")
+            if name:
+                login_id, password = generate_creds()
+                supabase.table("patients").insert({
+                    "name": name, 
+                    "login_id": login_id, 
+                    "password": password,
+                    "medical_history": []
+                }).execute()
+                st.success(f"Patient Registered!")
+                st.code(f"ID: {login_id}\nPassword: {password}", language="text")
+                st.info("Copy these credentials for the patient.")
+            else:
+                st.warning("Please enter a name.")
 
     elif menu == "Update Records":
-        patients = supabase.table("patients").select("name, login_id").execute()
-        p_list = {p['name']: p['login_id'] for p in patients.data}
-        selected_p = st.selectbox("Select Patient", list(p_list.keys()))
-        
-        uploaded_file = st.file_uploader("Upload Medical Report (PDF/Image)", type=['pdf', 'png', 'jpg'])
-        doc_notes = st.text_area("Doctor's Additional Notes")
-        
-        if st.button("Process & Commit"):
-            with st.spinner("AI analyzing multimodal input..."):
-                # Handle multimodal AI input (Image/PDF + Text)
-                content = ["Analyze this medical report. Extract the findings and translate them into simple English for the patient.", doc_notes]
-                if uploaded_file:
-                    content.append(uploaded_file)
-                
-                response = model.generate_content(content)
-                summary = response.text
-                
-                # Update DB
-                current_p = supabase.table("patients").select("medical_history").eq("login_id", p_list[selected_p]).execute()
-                history = current_p.data[0]['medical_history']
-                history.append({"date": str(pd.Timestamp.now()), "summary": summary})
-                supabase.table("patients").update({"medical_history": history}).eq("login_id", p_list[selected_p]).execute()
-                
-                st.success("Record committed to Cloud Database!")
-                st.info(f"**AI Summary:** {summary}")
+        st.subheader("Analyze & Update Patient History")
+        # Get all patients
+        patients_res = supabase.table("patients").select("name, login_id").execute()
+        if not patients_res.data:
+            st.write("No patients registered yet.")
+        else:
+            p_list = {p['name']: p['login_id'] for p in patients_res.data}
+            selected_name = st.selectbox("Select Patient", list(p_list.keys()))
+            selected_id = p_list[selected_name]
+            
+            uploaded_file = st.file_uploader("Upload Medical Report (PDF/Image)", type=['pdf', 'png', 'jpg', 'jpeg'])
+            doc_notes = st.text_area("Doctor's Additional Notes", placeholder="e.g., Patient feels dizzy, prescribed rest...")
+            
+            if st.button("Process with AI & Commit"):
+                if not uploaded_file and not doc_notes:
+                    st.error("Please provide either a file or typed notes.")
+                else:
+                    with st.spinner("AI is reading the report..."):
+                        try:
+                            # --- FIX FOR THE TYPEERROR ---
+                            content_parts = [
+                                "You are a clinical assistant. Analyze this report and doctor's notes. "
+                                "Provide a clear, simple summary for the patient explaining what this means. "
+                                "Use friendly language and bullet points.",
+                                f"Doctor's notes: {doc_notes}"
+                            ]
 
-# --- PATIENT DASHBOARD ---
+                            if uploaded_file:
+                                # Convert Streamlit upload to Gemini-friendly bytes
+                                file_data = uploaded_file.getvalue()
+                                file_mime = uploaded_file.type
+                                content_parts.append({
+                                    "mime_type": file_mime,
+                                    "data": file_data
+                                })
+                            
+                            # Generate AI response
+                            response = model.generate_content(content_parts)
+                            ai_summary = response.text
+                            
+                            # Fetch existing history to append
+                            curr = supabase.table("patients").select("medical_history").eq("login_id", selected_id).execute()
+                            history = curr.data[0]['medical_history']
+                            if history is None: history = []
+                            
+                            # Append new entry
+                            history.append({
+                                "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                "summary": ai_summary
+                            })
+                            
+                            # Update Database
+                            supabase.table("patients").update({"medical_history": history}).eq("login_id", selected_id).execute()
+                            
+                            st.success("Analysis Complete & Saved to Cloud!")
+                            st.markdown("### AI Summary Generated:")
+                            st.info(ai_summary)
+                            
+                        except Exception as e:
+                            st.error(f"Error processing AI: {e}")
+
+# --- 4. PATIENT DASHBOARD ---
 else:
     st.sidebar.button("Logout", on_click=logout)
     st.title(f"👋 Welcome, {st.session_state.user_data['name']}")
     
-    history = st.session_state.user_data['medical_history']
+    # Refresh data from DB to see latest updates
+    res = supabase.table("patients").select("medical_history").eq("login_id", st.session_state.user_data['login_id']).execute()
+    history = res.data[0]['medical_history']
+    
     if not history:
-        st.write("No medical records available yet.")
+        st.info("Your doctor hasn't uploaded any reports yet. They will appear here once processed.")
     else:
+        st.subheader("Your Medical History")
         for entry in reversed(history):
-            with st.expander(f"Report from {entry['date']}"):
-                st.write(entry['summary'])
+            with st.expander(f"Report from {entry['date']}", expanded=True):
+                st.markdown(entry['summary'])
