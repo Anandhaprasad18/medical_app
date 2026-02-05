@@ -10,13 +10,22 @@ st.set_page_config(page_title="MediCloud AI", layout="wide", page_icon="🏥")
 
 # Connect to Supabase
 # Ensure these are set in your Streamlit Cloud Secrets or .streamlit/secrets.toml
-url = st.secrets["SUPABASE_URL"]
-key = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url, key)
+try:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    supabase: Client = create_client(url, key)
+except Exception as e:
+    st.error("Supabase credentials not found. Please check your secrets.")
+    st.stop()
 
 # Configure Gemini
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel("models/gemini-1.5-flash-latest")
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    # --- FIX APPLIED HERE: Using the standard stable model name ---
+    model = genai.GenerativeModel("gemini-1.5-flash") 
+except Exception as e:
+    st.error("Gemini API Key not found. Please check your secrets.")
+    st.stop()
 
 
 # Helper: Generate random credentials
@@ -50,14 +59,17 @@ if not st.session_state.logged_in:
             st.rerun()
         else:
             # Check Supabase for Patient
-            res = supabase.table("patients").select("*").eq("login_id", user_id).eq("password", password).execute()
-            if res.data:
-                st.session_state.logged_in = True
-                st.session_state.user_role = "Patient"
-                st.session_state.user_data = res.data[0]
-                st.rerun()
-            else:
-                st.error("Invalid Credentials")
+            try:
+                res = supabase.table("patients").select("*").eq("login_id", user_id).eq("password", password).execute()
+                if res.data:
+                    st.session_state.logged_in = True
+                    st.session_state.user_role = "Patient"
+                    st.session_state.user_data = res.data[0]
+                    st.rerun()
+                else:
+                    st.error("Invalid Credentials")
+            except Exception as e:
+                st.error(f"Login Error: {e}")
     st.stop()
 
 # --- 3. DOCTOR DASHBOARD ---
@@ -73,15 +85,18 @@ if st.session_state.user_role == "Doctor":
         if st.button("Generate Account"):
             if name:
                 login_id, password = generate_creds()
-                supabase.table("patients").insert({
-                    "name": name, 
-                    "login_id": login_id, 
-                    "password": password,
-                    "medical_history": []
-                }).execute()
-                st.success(f"Patient Registered!")
-                st.code(f"ID: {login_id}\nPassword: {password}", language="text")
-                st.info("Copy these credentials for the patient.")
+                try:
+                    supabase.table("patients").insert({
+                        "name": name, 
+                        "login_id": login_id, 
+                        "password": password,
+                        "medical_history": []
+                    }).execute()
+                    st.success(f"Patient Registered!")
+                    st.code(f"ID: {login_id}\nPassword: {password}", language="text")
+                    st.info("Copy these credentials for the patient.")
+                except Exception as e:
+                    st.error(f"Database Error: {e}")
             else:
                 st.warning("Please enter a name.")
 
@@ -105,18 +120,23 @@ if st.session_state.user_role == "Doctor":
                 else:
                     with st.spinner("AI is reading the report..."):
                         try:
-                            # --- FIX FOR THE TYPEERROR ---
-                            content_parts = [
+                            # Prompt setup
+                            prompt_text = (
                                 "You are a clinical assistant. Analyze this report and doctor's notes. "
                                 "Provide a clear, simple summary for the patient explaining what this means. "
-                                "Use friendly language and bullet points.",
+                                "Use friendly language and bullet points. "
                                 f"Doctor's notes: {doc_notes}"
-                            ]
+                            )
+                            
+                            content_parts = [prompt_text]
 
                             if uploaded_file:
-                                # Convert Streamlit upload to Gemini-friendly bytes
-                                file_data = uploaded_file.getvalue()
+                                # Reset pointer to start just in case
+                                uploaded_file.seek(0)
+                                file_data = uploaded_file.read()
                                 file_mime = uploaded_file.type
+                                
+                                # Gemini format for inline data
                                 content_parts.append({
                                     "mime_type": file_mime,
                                     "data": file_data
@@ -153,14 +173,16 @@ else:
     st.title(f"👋 Welcome, {st.session_state.user_data['name']}")
     
     # Refresh data from DB to see latest updates
-    res = supabase.table("patients").select("medical_history").eq("login_id", st.session_state.user_data['login_id']).execute()
-    history = res.data[0]['medical_history']
-    
-    if not history:
-        st.info("Your doctor hasn't uploaded any reports yet. They will appear here once processed.")
-    else:
-        st.subheader("Your Medical History")
-        for entry in reversed(history):
-            with st.expander(f"Report from {entry['date']}", expanded=True):
-                st.markdown(entry['summary'])
-
+    try:
+        res = supabase.table("patients").select("medical_history").eq("login_id", st.session_state.user_data['login_id']).execute()
+        history = res.data[0]['medical_history']
+        
+        if not history:
+            st.info("Your doctor hasn't uploaded any reports yet. They will appear here once processed.")
+        else:
+            st.subheader("Your Medical History")
+            for entry in reversed(history):
+                with st.expander(f"Report from {entry['date']}", expanded=True):
+                    st.markdown(entry['summary'])
+    except Exception as e:
+        st.error(f"Error fetching records: {e}")
