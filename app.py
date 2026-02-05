@@ -1,30 +1,32 @@
 import streamlit as st
-import google.generativeai as genai
+import pandas as pd
+from groq import Groq
 from supabase import create_client, Client
-import random, string
-import datetime
+import random, string, datetime, base64
 from PIL import Image
+import io
 
-# --- 1. APP CONFIG ---
-st.set_page_config(page_title="MediCloud AI", layout="wide", page_icon="🏥")
+# --- 1. APP CONFIG & CONNECTIONS ---
+st.set_page_config(page_title="MediCloud AI (Groq)", layout="wide", page_icon="🏥")
 
-# Connect to Supabase
+# Supabase Setup
 try:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(url, key)
+    supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 except Exception:
-    st.error("Supabase secrets missing.")
+    st.error("Check Supabase Secrets.")
     st.stop()
 
-# Configure Gemini
+# Groq Setup
 try:
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 except Exception:
-    st.error("Gemini API Key missing.")
+    st.error("Groq API Key not found in secrets.")
     st.stop()
 
-# Helper: Generate random credentials
+# Helper: Encode image to base64 for Groq Vision
+def encode_image(image_file):
+    return base64.b64encode(image_file.read()).decode('utf-8')
+
 def generate_creds():
     uid = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     pwd = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
@@ -32,155 +34,88 @@ def generate_creds():
 
 # --- 2. LOGIN SYSTEM ---
 if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
-    st.session_state.user_role = None
-    st.session_state.user_data = None
-
-def logout():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.rerun()
+    st.session_state.logged_in, st.session_state.user_role = False, None
 
 if not st.session_state.logged_in:
-    st.title("🏥 MediCloud Secure Portal")
-    role = st.selectbox("I am a...", ["Doctor", "Patient"])
-    user_id = st.text_input("Login ID")
+    st.title("🏥 MediCloud Portal (Powered by Groq)")
+    role = st.selectbox("Role", ["Doctor", "Patient"])
+    user_id = st.text_input("ID")
     password = st.text_input("Password", type="password")
     
     if st.button("Login"):
         if role == "Doctor" and user_id == "admin" and password == "admin":
-            st.session_state.logged_in = True
-            st.session_state.user_role = "Doctor"
+            st.session_state.update({"logged_in": True, "user_role": "Doctor"})
             st.rerun()
         else:
-            try:
-                res = supabase.table("patients").select("*").eq("login_id", user_id).eq("password", password).execute()
-                if res.data:
-                    st.session_state.logged_in = True
-                    st.session_state.user_role = "Patient"
-                    st.session_state.user_data = res.data[0]
-                    st.rerun()
-                else:
-                    st.error("Invalid Credentials")
-            except Exception as e:
-                st.error(f"Login Error: {e}")
+            res = supabase.table("patients").select("*").eq("login_id", user_id).eq("password", password).execute()
+            if res.data:
+                st.session_state.update({"logged_in": True, "user_role": "Patient", "user_data": res.data[0]})
+                st.rerun()
+            else: st.error("Invalid Login")
     st.stop()
 
 # --- 3. DOCTOR DASHBOARD ---
 if st.session_state.user_role == "Doctor":
-    st.sidebar.button("Logout", on_click=logout)
-    st.title("👨‍⚕️ Clinician Control Center")
+    st.sidebar.button("Logout", on_click=lambda: st.session_state.clear())
+    st.title("👨‍⚕️ Clinician Dashboard")
     
-    menu = st.sidebar.radio("Navigation", ["Register New Patient", "Update Records"])
+    menu = st.sidebar.radio("Menu", ["Register Patient", "Upload & Analyze"])
     
-    if menu == "Register New Patient":
-        st.subheader("Add New Patient to System")
-        name = st.text_input("Full Name")
-        if st.button("Generate Account"):
-            if name:
-                login_id, password = generate_creds()
+    if menu == "Register Patient":
+        name = st.text_input("Patient Name")
+        if st.button("Create Account"):
+            lid, pwd = generate_creds()
+            supabase.table("patients").insert({"name": name, "login_id": lid, "password": pwd, "medical_history": []}).execute()
+            st.success(f"Created! ID: {lid} | Pwd: {pwd}")
+
+    elif menu == "Upload & Analyze":
+        p_res = supabase.table("patients").select("name, login_id").execute()
+        patients = {p['name']: p['login_id'] for p in p_res.data}
+        target = st.selectbox("Select Patient", list(patients.keys()))
+        
+        file = st.file_uploader("Upload Medical Scan/Report", type=['png', 'jpg', 'jpeg'])
+        notes = st.text_area("Observations")
+        
+        if st.button("Analyze with Groq"):
+            with st.spinner("Groq is processing..."):
                 try:
-                    supabase.table("patients").insert({
-                        "name": name, 
-                        "login_id": login_id, 
-                        "password": password,
-                        "medical_history": []
-                    }).execute()
-                    st.success(f"Patient Registered!")
-                    st.code(f"ID: {login_id}\nPassword: {password}", language="text")
-                except Exception as e:
-                    st.error(f"Database Error: {e}")
-
-    elif menu == "Update Records":
-        st.subheader("Analyze & Update Patient History")
-        patients_res = supabase.table("patients").select("name, login_id").execute()
-        
-        if not patients_res.data:
-            st.write("No patients registered.")
-        else:
-            p_list = {p['name']: p['login_id'] for p in patients_res.data}
-            selected_name = st.selectbox("Select Patient", list(p_list.keys()))
-            selected_id = p_list[selected_name]
-            
-            uploaded_file = st.file_uploader("Upload Medical Report (Image/PDF)", type=['png', 'jpg', 'jpeg', 'pdf'])
-            doc_notes = st.text_area("Doctor's Notes", placeholder="E.g., Patient showing signs of fatigue...")
-            
-            if st.button("Process with AI & Commit"):
-                with st.spinner("AI is analyzing image & text..."):
-                    try:
-                        # --- 1. MODEL SELECTION & FALLBACK ---
-                        model = None
-                        # Try Flash first (fastest/cheapest), then Pro, then fallback
-                        for m_name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
-                            try:
-                                test_m = genai.GenerativeModel(m_name)
-                                model = test_m
-                                break
-                            except:
-                                continue
-                        
-                        if not model:
-                            st.error("Could not connect to Google AI. Please update 'google-generativeai' library.")
-                            st.stop()
-
-                        # --- 2. PREPARE CONTENT ---
-                        content_parts = []
-                        prompt = (
-                            "You are a helpful medical assistant. Analyze the attached medical report image "
-                            "and the doctor's notes. Create a simple, easy-to-understand summary for the patient. "
-                            f"\n\nDoctor's Notes: {doc_notes}"
-                        )
-                        content_parts.append(prompt)
-
-                        if uploaded_file:
-                            # Handling Images specifically for Gemini
-                            mime_type = uploaded_file.type
-                            if "image" in mime_type:
-                                image = Image.open(uploaded_file)
-                                content_parts.append(image)
-                            else:
-                                # For PDFs, we pass the raw bytes
-                                content_parts.append({
-                                    "mime_type": mime_type,
-                                    "data": uploaded_file.getvalue()
-                                })
-
-                        # --- 3. GENERATE & SAVE ---
-                        response = model.generate_content(content_parts)
-                        ai_summary = response.text
-                        
-                        # Save to Supabase
-                        curr = supabase.table("patients").select("medical_history").eq("login_id", selected_id).execute()
-                        history = curr.data[0]['medical_history'] or []
-                        
-                        history.append({
-                            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "summary": ai_summary
+                    messages = [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Analyze this medical image and these notes: {notes}. Provide a patient-friendly summary."},
+                        ]
+                    }]
+                    
+                    if file:
+                        base64_image = encode_image(file)
+                        messages[0]["content"].append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
                         })
-                        
-                        supabase.table("patients").update({"medical_history": history}).eq("login_id", selected_id).execute()
-                        
-                        st.success("Analysis Saved!")
-                        st.info(ai_summary)
 
-                    except Exception as e:
-                        st.error(f"AI Error: {e}")
+                    # Using a Groq Vision model
+                    completion = client.chat.completions.create(
+                        model="llama-3.2-11b-vision-preview",
+                        messages=messages,
+                        temperature=0.5,
+                        max_tokens=1024
+                    )
+                    
+                    summary = completion.choices[0].message.content
+                    
+                    # Update DB
+                    hist = supabase.table("patients").select("medical_history").eq("login_id", patients[target]).execute().data[0]['medical_history'] or []
+                    hist.append({"date": str(datetime.date.today()), "summary": summary})
+                    supabase.table("patients").update({"medical_history": hist}).eq("login_id", patients[target]).execute()
+                    
+                    st.info(summary)
+                except Exception as e:
+                    st.error(f"Groq Error: {e}")
 
-# --- 4. PATIENT DASHBOARD ---
+# --- 4. PATIENT VIEW ---
 else:
-    st.sidebar.button("Logout", on_click=logout)
-    st.title(f"👋 Welcome, {st.session_state.user_data['name']}")
-    
-    try:
-        res = supabase.table("patients").select("medical_history").eq("login_id", st.session_state.user_data['login_id']).execute()
-        history = res.data[0]['medical_history']
-        
-        if not history:
-            st.info("No records found.")
-        else:
-            st.subheader("Your Medical History")
-            for entry in reversed(history):
-                with st.expander(f"Report: {entry['date']}", expanded=True):
-                    st.markdown(entry['summary'])
-    except:
-        st.error("Could not load history.")
+    st.title(f"Record for {st.session_state.user_data['name']}")
+    history = supabase.table("patients").select("medical_history").eq("login_id", st.session_state.user_data['login_id']).execute().data[0]['medical_history']
+    for item in reversed(history or []):
+        with st.expander(f"Report: {item['date']}"):
+            st.write(item['summary'])
