@@ -9,7 +9,6 @@ import datetime
 st.set_page_config(page_title="MediCloud AI", layout="wide", page_icon="🏥")
 
 # Connect to Supabase
-# Ensure these are set in your Streamlit Cloud Secrets or .streamlit/secrets.toml
 try:
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
@@ -21,12 +20,9 @@ except Exception as e:
 # Configure Gemini
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    # --- FIX APPLIED HERE: Using the standard stable model name ---
-    model = genai.GenerativeModel("gemini-1.5-flash") 
 except Exception as e:
     st.error("Gemini API Key not found. Please check your secrets.")
     st.stop()
-
 
 # Helper: Generate random credentials
 def generate_creds():
@@ -52,13 +48,11 @@ if not st.session_state.logged_in:
     password = st.text_input("Password", type="password")
     
     if st.button("Login"):
-        # Doctor Hardcoded Login
         if role == "Doctor" and user_id == "admin" and password == "admin":
             st.session_state.logged_in = True
             st.session_state.user_role = "Doctor"
             st.rerun()
         else:
-            # Check Supabase for Patient
             try:
                 res = supabase.table("patients").select("*").eq("login_id", user_id).eq("password", password).execute()
                 if res.data:
@@ -102,7 +96,6 @@ if st.session_state.user_role == "Doctor":
 
     elif menu == "Update Records":
         st.subheader("Analyze & Update Patient History")
-        # Get all patients
         patients_res = supabase.table("patients").select("name, login_id").execute()
         if not patients_res.data:
             st.write("No patients registered yet.")
@@ -112,7 +105,7 @@ if st.session_state.user_role == "Doctor":
             selected_id = p_list[selected_name]
             
             uploaded_file = st.file_uploader("Upload Medical Report (PDF/Image)", type=['pdf', 'png', 'jpg', 'jpeg'])
-            doc_notes = st.text_area("Doctor's Additional Notes", placeholder="e.g., Patient feels dizzy, prescribed rest...")
+            doc_notes = st.text_area("Doctor's Additional Notes", placeholder="e.g., Patient feels dizzy...")
             
             if st.button("Process with AI & Commit"):
                 if not uploaded_file and not doc_notes:
@@ -120,47 +113,59 @@ if st.session_state.user_role == "Doctor":
                 else:
                     with st.spinner("AI is reading the report..."):
                         try:
-                            # Prompt setup
+                            # --- ROBUST MODEL SELECTION ---
+                            # We try Flash first, then Pro, then standard Gemini
+                            valid_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+                            active_model = None
+                            
+                            # Simple retry logic to find a working model
+                            for m_name in valid_models:
+                                try:
+                                    test_model = genai.GenerativeModel(m_name)
+                                    # Very cheap test call
+                                    test_model.generate_content("test")
+                                    active_model = test_model
+                                    break # Found one that works
+                                except:
+                                    continue
+                            
+                            if not active_model:
+                                st.error("Could not connect to any Gemini models. Check API Key or Library Version.")
+                                st.stop()
+
+                            # Prepare Content
                             prompt_text = (
                                 "You are a clinical assistant. Analyze this report and doctor's notes. "
                                 "Provide a clear, simple summary for the patient explaining what this means. "
                                 "Use friendly language and bullet points. "
                                 f"Doctor's notes: {doc_notes}"
                             )
-                            
                             content_parts = [prompt_text]
 
                             if uploaded_file:
-                                # Reset pointer to start just in case
                                 uploaded_file.seek(0)
-                                file_data = uploaded_file.read()
-                                file_mime = uploaded_file.type
-                                
-                                # Gemini format for inline data
                                 content_parts.append({
-                                    "mime_type": file_mime,
-                                    "data": file_data
+                                    "mime_type": uploaded_file.type,
+                                    "data": uploaded_file.read()
                                 })
                             
-                            # Generate AI response
-                            response = model.generate_content(content_parts)
+                            # Generate
+                            response = active_model.generate_content(content_parts)
                             ai_summary = response.text
                             
-                            # Fetch existing history to append
+                            # Save to Supabase
                             curr = supabase.table("patients").select("medical_history").eq("login_id", selected_id).execute()
                             history = curr.data[0]['medical_history']
                             if history is None: history = []
                             
-                            # Append new entry
                             history.append({
                                 "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                                 "summary": ai_summary
                             })
                             
-                            # Update Database
                             supabase.table("patients").update({"medical_history": history}).eq("login_id", selected_id).execute()
                             
-                            st.success("Analysis Complete & Saved to Cloud!")
+                            st.success("Analysis Complete & Saved!")
                             st.markdown("### AI Summary Generated:")
                             st.info(ai_summary)
                             
@@ -172,13 +177,12 @@ else:
     st.sidebar.button("Logout", on_click=logout)
     st.title(f"👋 Welcome, {st.session_state.user_data['name']}")
     
-    # Refresh data from DB to see latest updates
     try:
         res = supabase.table("patients").select("medical_history").eq("login_id", st.session_state.user_data['login_id']).execute()
         history = res.data[0]['medical_history']
         
         if not history:
-            st.info("Your doctor hasn't uploaded any reports yet. They will appear here once processed.")
+            st.info("Your doctor hasn't uploaded any reports yet.")
         else:
             st.subheader("Your Medical History")
             for entry in reversed(history):
