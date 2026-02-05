@@ -1,11 +1,11 @@
 import streamlit as st
-import pandas as pd
 import google.generativeai as genai
 from supabase import create_client, Client
 import random, string
 import datetime
+from PIL import Image
 
-# --- 1. APP CONFIG & DB CONNECTION ---
+# --- 1. APP CONFIG ---
 st.set_page_config(page_title="MediCloud AI", layout="wide", page_icon="🏥")
 
 # Connect to Supabase
@@ -13,15 +13,15 @@ try:
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
-except Exception as e:
-    st.error("Supabase credentials not found. Please check your secrets.")
+except Exception:
+    st.error("Supabase secrets missing.")
     st.stop()
 
 # Configure Gemini
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-except Exception as e:
-    st.error("Gemini API Key not found. Please check your secrets.")
+except Exception:
+    st.error("Gemini API Key missing.")
     st.stop()
 
 # Helper: Generate random credentials
@@ -88,89 +88,83 @@ if st.session_state.user_role == "Doctor":
                     }).execute()
                     st.success(f"Patient Registered!")
                     st.code(f"ID: {login_id}\nPassword: {password}", language="text")
-                    st.info("Copy these credentials for the patient.")
                 except Exception as e:
                     st.error(f"Database Error: {e}")
-            else:
-                st.warning("Please enter a name.")
 
     elif menu == "Update Records":
         st.subheader("Analyze & Update Patient History")
         patients_res = supabase.table("patients").select("name, login_id").execute()
+        
         if not patients_res.data:
-            st.write("No patients registered yet.")
+            st.write("No patients registered.")
         else:
             p_list = {p['name']: p['login_id'] for p in patients_res.data}
             selected_name = st.selectbox("Select Patient", list(p_list.keys()))
             selected_id = p_list[selected_name]
             
-            uploaded_file = st.file_uploader("Upload Medical Report (PDF/Image)", type=['pdf', 'png', 'jpg', 'jpeg'])
-            doc_notes = st.text_area("Doctor's Additional Notes", placeholder="e.g., Patient feels dizzy...")
+            uploaded_file = st.file_uploader("Upload Medical Report (Image/PDF)", type=['png', 'jpg', 'jpeg', 'pdf'])
+            doc_notes = st.text_area("Doctor's Notes", placeholder="E.g., Patient showing signs of fatigue...")
             
             if st.button("Process with AI & Commit"):
-                if not uploaded_file and not doc_notes:
-                    st.error("Please provide either a file or typed notes.")
-                else:
-                    with st.spinner("AI is reading the report..."):
-                        try:
-                            # --- ROBUST MODEL SELECTION ---
-                            # We try Flash first, then Pro, then standard Gemini
-                            valid_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
-                            active_model = None
-                            
-                            # Simple retry logic to find a working model
-                            for m_name in valid_models:
-                                try:
-                                    test_model = genai.GenerativeModel(m_name)
-                                    # Very cheap test call
-                                    test_model.generate_content("test")
-                                    active_model = test_model
-                                    break # Found one that works
-                                except:
-                                    continue
-                            
-                            if not active_model:
-                                st.error("Could not connect to any Gemini models. Check API Key or Library Version.")
-                                st.stop()
+                with st.spinner("AI is analyzing image & text..."):
+                    try:
+                        # --- 1. MODEL SELECTION & FALLBACK ---
+                        model = None
+                        # Try Flash first (fastest/cheapest), then Pro, then fallback
+                        for m_name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
+                            try:
+                                test_m = genai.GenerativeModel(m_name)
+                                model = test_m
+                                break
+                            except:
+                                continue
+                        
+                        if not model:
+                            st.error("Could not connect to Google AI. Please update 'google-generativeai' library.")
+                            st.stop()
 
-                            # Prepare Content
-                            prompt_text = (
-                                "You are a clinical assistant. Analyze this report and doctor's notes. "
-                                "Provide a clear, simple summary for the patient explaining what this means. "
-                                "Use friendly language and bullet points. "
-                                f"Doctor's notes: {doc_notes}"
-                            )
-                            content_parts = [prompt_text]
+                        # --- 2. PREPARE CONTENT ---
+                        content_parts = []
+                        prompt = (
+                            "You are a helpful medical assistant. Analyze the attached medical report image "
+                            "and the doctor's notes. Create a simple, easy-to-understand summary for the patient. "
+                            f"\n\nDoctor's Notes: {doc_notes}"
+                        )
+                        content_parts.append(prompt)
 
-                            if uploaded_file:
-                                uploaded_file.seek(0)
+                        if uploaded_file:
+                            # Handling Images specifically for Gemini
+                            mime_type = uploaded_file.type
+                            if "image" in mime_type:
+                                image = Image.open(uploaded_file)
+                                content_parts.append(image)
+                            else:
+                                # For PDFs, we pass the raw bytes
                                 content_parts.append({
-                                    "mime_type": uploaded_file.type,
-                                    "data": uploaded_file.read()
+                                    "mime_type": mime_type,
+                                    "data": uploaded_file.getvalue()
                                 })
-                            
-                            # Generate
-                            response = active_model.generate_content(content_parts)
-                            ai_summary = response.text
-                            
-                            # Save to Supabase
-                            curr = supabase.table("patients").select("medical_history").eq("login_id", selected_id).execute()
-                            history = curr.data[0]['medical_history']
-                            if history is None: history = []
-                            
-                            history.append({
-                                "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                "summary": ai_summary
-                            })
-                            
-                            supabase.table("patients").update({"medical_history": history}).eq("login_id", selected_id).execute()
-                            
-                            st.success("Analysis Complete & Saved!")
-                            st.markdown("### AI Summary Generated:")
-                            st.info(ai_summary)
-                            
-                        except Exception as e:
-                            st.error(f"Error processing AI: {e}")
+
+                        # --- 3. GENERATE & SAVE ---
+                        response = model.generate_content(content_parts)
+                        ai_summary = response.text
+                        
+                        # Save to Supabase
+                        curr = supabase.table("patients").select("medical_history").eq("login_id", selected_id).execute()
+                        history = curr.data[0]['medical_history'] or []
+                        
+                        history.append({
+                            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "summary": ai_summary
+                        })
+                        
+                        supabase.table("patients").update({"medical_history": history}).eq("login_id", selected_id).execute()
+                        
+                        st.success("Analysis Saved!")
+                        st.info(ai_summary)
+
+                    except Exception as e:
+                        st.error(f"AI Error: {e}")
 
 # --- 4. PATIENT DASHBOARD ---
 else:
@@ -182,11 +176,11 @@ else:
         history = res.data[0]['medical_history']
         
         if not history:
-            st.info("Your doctor hasn't uploaded any reports yet.")
+            st.info("No records found.")
         else:
             st.subheader("Your Medical History")
             for entry in reversed(history):
-                with st.expander(f"Report from {entry['date']}", expanded=True):
+                with st.expander(f"Report: {entry['date']}", expanded=True):
                     st.markdown(entry['summary'])
-    except Exception as e:
-        st.error(f"Error fetching records: {e}")
+    except:
+        st.error("Could not load history.")
