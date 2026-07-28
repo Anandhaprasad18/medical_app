@@ -1,0 +1,5 @@
+streamlit>=1.37.0
+supabase>=2.7.4
+groq>=0.11.0
+pypdf>=5.0.0
+pandas>=2.2.2
